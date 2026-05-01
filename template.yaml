@@ -1,0 +1,530 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  Log Fingerprinting & Pattern Discovery Pipeline
+  Ingests CloudWatch Logs, fingerprints error messages, stores state in DynamoDB,
+  raises SNS regression alerts when a new ReleaseID introduces an unseen error,
+  and runs a daily AI agent to generate per-stream sanitization rules.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Parameters — tunable without code changes
+# ─────────────────────────────────────────────────────────────────────────────
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment name.
+
+  ReleaseID:
+    Type: String
+    Default: "1.0.0"
+    Description: >
+      Semantic version of the current release. Used to detect error regressions
+      — if a fingerprint appears for the first time on a *new* ReleaseID it
+      triggers an SNS alert.
+
+  SourceLogGroupName:
+    Type: String
+    Description: Name of the CloudWatch Log Group to subscribe to.
+
+  ExcludePatterns:
+    Type: CommaDelimitedList
+    Default: "Unable to upload to API,friendly_reason:"
+    Description: >
+      Comma-separated list of substrings. Log events whose @message contains
+      ANY of these strings are dropped before fingerprinting.
+
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: >
+      (Optional) E-mail address to subscribe to the regression SNS topic.
+      Leave empty to skip the e-mail subscription.
+
+  AiProvider:
+    Type: String
+    Default: "none"
+    AllowedValues: [none, bedrock, gemini]
+    Description: >
+      AI enrichment backend for the fingerprinter hook. Set to "bedrock" or
+      "gemini" to enable. "none" disables it.
+
+  VectorBackend:
+    Type: String
+    Default: "dynamodb"
+    AllowedValues: [dynamodb, opensearch]
+    Description: >
+      Vector storage backend for unknown-pattern embeddings.
+      "dynamodb" uses DynamoDB + in-process NumPy cosine similarity (< ~100k/day).
+      "opensearch" uses OpenSearch Serverless k-NN (HNSW) for higher volume.
+
+  OpenSearchEndpoint:
+    Type: String
+    Default: ""
+    Description: >
+      (Required when VectorBackend=opensearch) OpenSearch Serverless collection
+      endpoint, e.g. https://abc123.us-east-1.aoss.amazonaws.com
+
+  BedrockEmbeddingModel:
+    Type: String
+    Default: "amazon.titan-embed-text-v2:0"
+    Description: Bedrock Titan embedding model ID used by the enhancement agent.
+
+  BedrockLLMModel:
+    Type: String
+    Default: "anthropic.claude-3-5-sonnet-20241022-v2:0"
+    Description: Bedrock Claude model ID used for rule generation.
+
+  ClusterEps:
+    Type: String
+    Default: "0.15"
+    Description: >
+      DBSCAN epsilon on cosine distance (0–2). Lower = tighter clusters.
+      Tune per stream family if needed.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Globals — applied to all Lambda functions
+# ─────────────────────────────────────────────────────────────────────────────
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    Timeout: 60
+    MemorySize: 256
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        RELEASE_ID: !Ref ReleaseID
+        TABLE_NAME: !Ref FingerprintTable
+        SNS_TOPIC_ARN: !Ref RegressionAlertTopic
+        AI_PROVIDER: !Ref AiProvider
+        STREAM_PROFILES_TABLE: !Ref StreamProfilesTable
+        UNKNOWN_PATTERNS_TABLE: !Ref UnknownPatternsTable
+        VECTOR_BACKEND: !Ref VectorBackend
+        OPENSEARCH_ENDPOINT: !Ref OpenSearchEndpoint
+        BEDROCK_EMBEDDING_MODEL: !Ref BedrockEmbeddingModel
+        BEDROCK_LLM_MODEL: !Ref BedrockLLMModel
+        CLUSTER_EPS: !Ref ClusterEps
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Resources
+# ─────────────────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── DynamoDB — error fingerprint state store ─────────────────────────────
+  FingerprintTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub "log-fingerprints-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: ErrorSignature
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ErrorSignature
+          KeyType: HASH
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: log-fingerprinting
+
+  # ── DynamoDB — per-stream rule profiles ──────────────────────────────────
+  StreamProfilesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub "log-stream-profiles-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: StreamId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: StreamId
+          KeyType: HASH
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: log-fingerprinting
+
+  # ── DynamoDB — unknown log patterns for AI enhancement ───────────────────
+  # PK=StreamId, SK=PatternId enables targeted per-stream queries.
+  # Status values: UNPROCESSED → EMBEDDED → PROCESSED
+  UnknownPatternsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub "log-unknown-patterns-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: StreamId
+          AttributeType: S
+        - AttributeName: PatternId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: StreamId
+          KeyType: HASH
+        - AttributeName: PatternId
+          KeyType: RANGE
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: log-fingerprinting
+
+  # ── SNS — regression alert topic ─────────────────────────────────────────
+  RegressionAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "log-fingerprint-regressions-${Environment}"
+      DisplayName: !Sub "Log Fingerprint Regression Alerts (${Environment})"
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  RegressionAlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref RegressionAlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ── Lambda — Ingestor ────────────────────────────────────────────────────
+  IngestorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "log-fingerprint-ingestor-${Environment}"
+      CodeUri: src/handlers/
+      Handler: ingestor.handler
+      Description: >
+        Decodes CloudWatch Logs subscription payloads, applies the ExcludePatterns
+        filter, and forwards qualifying log events for fingerprinting.
+      Environment:
+        Variables:
+          EXCLUDE_PATTERNS: !Join [",", !Ref ExcludePatterns]
+          FINGERPRINTER_FUNCTION_NAME: !Ref FingerprinterFunction
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: InvokeFingerprinter
+              Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !GetAtt FingerprinterFunction.Arn
+
+  IngestorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/log-fingerprint-ingestor-${Environment}"
+      RetentionInDays: 14
+
+  SourceLogSubscriptionFilter:
+    Type: AWS::Logs::SubscriptionFilter
+    Properties:
+      LogGroupName: !Ref SourceLogGroupName
+      FilterPattern: >-
+        { ($.message = "*ERROR*") && ($.message != "*Unable to upload to API*") && ($.message != "*friendly_reason:*") }
+      DestinationArn: !GetAtt IngestorFunction.Arn
+
+  IngestorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt IngestorFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: logs.amazonaws.com
+      SourceArn: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${SourceLogGroupName}:*"
+
+  # ── Lambda — Fingerprinter ───────────────────────────────────────────────
+  FingerprinterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "log-fingerprint-fingerprinter-${Environment}"
+      CodeUri: src/handlers/
+      Handler: fingerprinter.handler
+      Description: >
+        Sanitizes log messages using per-stream rules, generates SHA-256 fingerprints,
+        upserts state in DynamoDB, publishes SNS alerts for regression patterns, and
+        stores new patterns for daily AI enhancement.
+      Layers:
+        - !Ref SanitizerLayer
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: DynamoDBReadWrite
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+              Resource: !GetAtt FingerprintTable.Arn
+            - Sid: StreamProfileRead
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+              Resource: !GetAtt StreamProfilesTable.Arn
+            - Sid: UnknownPatternsWrite
+              Effect: Allow
+              Action:
+                - dynamodb:PutItem
+              Resource: !GetAtt UnknownPatternsTable.Arn
+            - Sid: PublishSNSAlert
+              Effect: Allow
+              Action: sns:Publish
+              Resource: !Ref RegressionAlertTopic
+            - Sid: BedrockInvokeModel
+              Effect: Allow
+              Action: bedrock:InvokeModel
+              Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0"
+              Condition:
+                StringEquals:
+                  aws:RequestedRegion: !Ref AWS::Region
+
+  FingerprinterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/log-fingerprint-fingerprinter-${Environment}"
+      RetentionInDays: 14
+
+  # ── Lambda Layer — shared sanitizer + stream profile module ─────────────
+  SanitizerLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub "log-fingerprint-sanitizer-${Environment}"
+      Description: Shared log sanitizer, stream profile adapter, and fingerprinting logic.
+      ContentUri: src/
+      CompatibleRuntimes: [python3.12]
+      RetentionPolicy: Retain
+
+  # ── Lambda Layer — AI agent dependencies (numpy, sklearn, opensearch-py) ─
+  AgentDepsLayer:
+    Type: AWS::Serverless::LayerVersion
+    Metadata:
+      BuildMethod: python3.12
+    Properties:
+      LayerName: !Sub "log-fingerprint-agent-deps-${Environment}"
+      Description: NumPy, scikit-learn, opensearch-py for the enhancement agent.
+      ContentUri: layer/
+      CompatibleRuntimes: [python3.12]
+      RetentionPolicy: Retain
+
+  # ── Lambda — Enhancement Agent ───────────────────────────────────────────
+  # Invoked by Step Functions. Handles list_streams | embed_batch |
+  # cluster_and_generate actions. Timeout=900 (15 min) for embed_batch.
+  EnhancementAgentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "log-fingerprint-enhancement-agent-${Environment}"
+      CodeUri: src/handlers/
+      Handler: enhancement_agent.handler
+      Timeout: 900
+      MemorySize: 1024
+      Description: >
+        Daily AI agent: embeds unknown log patterns via Bedrock Titan, clusters
+        them with NumPy DBSCAN, prompts Claude to generate regex rules, and stores
+        approved rules back to the per-stream StreamProfile.
+      Layers:
+        - !Ref SanitizerLayer
+        - !Ref AgentDepsLayer
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: UnknownPatternsReadWrite
+              Effect: Allow
+              Action:
+                - dynamodb:Query
+                - dynamodb:Scan
+                - dynamodb:UpdateItem
+                - dynamodb:GetItem
+              Resource: !GetAtt UnknownPatternsTable.Arn
+            - Sid: StreamProfilesReadWrite
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+              Resource: !GetAtt StreamProfilesTable.Arn
+            - Sid: BedrockEmbedAndGenerate
+              Effect: Allow
+              Action: bedrock:InvokeModel
+              Resource:
+                - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0"
+                - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-5-sonnet-20241022-v2:0"
+
+  EnhancementAgentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/log-fingerprint-enhancement-agent-${Environment}"
+      RetentionInDays: 30
+
+  # ── Step Functions — daily enhancement pipeline ──────────────────────────
+  EnhancementStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "log-fp-sfn-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeEnhancementAgent
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt EnhancementAgentFunction.Arn
+
+  EnhancementPipeline:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub "log-fingerprint-enhancement-${Environment}"
+      Role: !GetAtt EnhancementStateMachineRole.Arn
+      # Distributed Map allows parallel per-stream processing and handles
+      # large stream-id lists beyond the 256KB state size limit.
+      Definition:
+        Comment: Daily log pattern enhancement pipeline
+        StartAt: ListStreams
+        States:
+          ListStreams:
+            Type: Task
+            Resource: !GetAtt EnhancementAgentFunction.Arn
+            Parameters:
+              action: list_streams
+            ResultPath: "$.listResult"
+            Next: ProcessStreams
+            Retry:
+              - ErrorEquals: [States.TaskFailed]
+                IntervalSeconds: 30
+                MaxAttempts: 2
+
+          ProcessStreams:
+            Type: Map
+            ItemsPath: "$.listResult.stream_ids"
+            MaxConcurrency: 5
+            Iterator:
+              StartAt: EmbedBatch
+              States:
+                EmbedBatch:
+                  Type: Task
+                  Resource: !GetAtt EnhancementAgentFunction.Arn
+                  Parameters:
+                    action: embed_batch
+                    "stream_id.$": "$"
+                  ResultPath: "$.embedResult"
+                  Next: ClusterAndGenerate
+                  Retry:
+                    - ErrorEquals: [States.TaskFailed]
+                      IntervalSeconds: 60
+                      MaxAttempts: 2
+
+                ClusterAndGenerate:
+                  Type: Task
+                  Resource: !GetAtt EnhancementAgentFunction.Arn
+                  Parameters:
+                    action: cluster_and_generate
+                    "stream_id.$": "$.embedResult.stream_id"
+                  ResultPath: "$.clusterResult"
+                  End: true
+                  Retry:
+                    - ErrorEquals: [States.TaskFailed]
+                      IntervalSeconds: 60
+                      MaxAttempts: 2
+            End: true
+
+  # ── EventBridge — daily trigger ──────────────────────────────────────────
+  EnhancementScheduleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "log-fp-schedule-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartEnhancementPipeline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref EnhancementPipeline
+
+  EnhancementDailySchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "log-fp-daily-enhancement-${Environment}"
+      Description: Triggers the log pattern enhancement pipeline daily at 02:00 UTC
+      ScheduleExpression: "cron(0 2 * * ? *)"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !Ref EnhancementPipeline
+        RoleArn: !GetAtt EnhancementScheduleRole.Arn
+        Input: "{}"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Conditions
+# ─────────────────────────────────────────────────────────────────────────────
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Outputs
+# ─────────────────────────────────────────────────────────────────────────────
+Outputs:
+  FingerprintTableName:
+    Description: DynamoDB table storing error fingerprint state.
+    Value: !Ref FingerprintTable
+    Export:
+      Name: !Sub "${AWS::StackName}-FingerprintTable"
+
+  StreamProfilesTableName:
+    Description: DynamoDB table storing per-stream custom rule profiles.
+    Value: !Ref StreamProfilesTable
+    Export:
+      Name: !Sub "${AWS::StackName}-StreamProfilesTable"
+
+  UnknownPatternsTableName:
+    Description: DynamoDB table storing unknown log patterns for AI enhancement.
+    Value: !Ref UnknownPatternsTable
+    Export:
+      Name: !Sub "${AWS::StackName}-UnknownPatternsTable"
+
+  RegressionAlertTopicArn:
+    Description: SNS topic ARN for regression alerts.
+    Value: !Ref RegressionAlertTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-RegressionTopic"
+
+  IngestorFunctionArn:
+    Description: ARN of the log ingestor Lambda.
+    Value: !GetAtt IngestorFunction.Arn
+
+  FingerprinterFunctionArn:
+    Description: ARN of the fingerprinter Lambda.
+    Value: !GetAtt FingerprinterFunction.Arn
+
+  EnhancementAgentFunctionArn:
+    Description: ARN of the enhancement agent Lambda.
+    Value: !GetAtt EnhancementAgentFunction.Arn
+
+  EnhancementPipelineArn:
+    Description: ARN of the Step Functions enhancement pipeline.
+    Value: !Ref EnhancementPipeline
+

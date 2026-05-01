@@ -1,0 +1,6 @@
+# Dependencies for the AgentDepsLayer (enhancement agent Lambda layer).
+# boto3 is excluded — it is provided by the Lambda runtime.
+numpy>=1.26.0
+scikit-learn>=1.4.0
+opensearch-py>=2.4.0
+requests-aws4auth>=1.3.0

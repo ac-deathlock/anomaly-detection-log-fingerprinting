@@ -1,0 +1,638 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Log Fingerprinting & Pattern Discovery Pipeline — Production-Grade Infrastructure
+  Deploys: KMS keys, DynamoDB, SNS, SQS DLQ, Lambda (with CodeDeploy aliases),
+  CloudWatch Alarms, X-Ray tracing, and least-privilege IAM roles.
+  This is a pure CloudFormation template (no SAM transform).
+  Lambda code is loaded from S3 — use scripts/deploy.ps1 to package & deploy.
+
+# ══════════════════════════════════════════════════════════════════════════════
+# METADATA
+# ══════════════════════════════════════════════════════════════════════════════
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: "Environment" }
+        Parameters: [Environment, ReleaseID]
+      - Label: { default: "Log Source" }
+        Parameters: [SourceLogGroupName, ExcludePatterns]
+      - Label: { default: "Alerting" }
+        Parameters: [AlertEmail, AlarmEmail]
+      - Label: { default: "Deployment" }
+        Parameters: [CodeBucketName, IngestorS3Key, FingerprinterS3Key, LambdaTrafficShiftPercent]
+      - Label: { default: "AI Enrichment" }
+        Parameters: [AiProvider]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PARAMETERS
+# ══════════════════════════════════════════════════════════════════════════════
+Parameters:
+
+  # ── Core ─────────────────────────────────────────────────────────────────
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  ReleaseID:
+    Type: String
+    Default: "1.0.0"
+    Description: Semantic version. New fingerprints on a fresh ReleaseID trigger SNS.
+
+  # ── Log source ────────────────────────────────────────────────────────────
+  SourceLogGroupName:
+    Type: String
+    Description: CloudWatch Log Group to subscribe to (must exist before stack creation).
+
+  ExcludePatterns:
+    Type: String
+    Default: "Unable to upload to API,friendly_reason:"
+    Description: Comma-separated substrings. Matching log events are dropped pre-fingerprint.
+
+  # ── Alerting ──────────────────────────────────────────────────────────────
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: E-mail for regression SNS alerts (leave blank to skip subscription).
+
+  AlarmEmail:
+    Type: String
+    Default: ""
+    Description: E-mail for CloudWatch alarm notifications (leave blank to skip).
+
+  # ── Code locations (S3) ───────────────────────────────────────────────────
+  CodeBucketName:
+    Type: String
+    Description: S3 bucket containing packaged Lambda ZIP files.
+
+  IngestorS3Key:
+    Type: String
+    Default: "releases/ingestor.zip"
+    Description: S3 key for the Ingestor Lambda deployment package.
+
+  FingerprinterS3Key:
+    Type: String
+    Default: "releases/fingerprinter.zip"
+    Description: S3 key for the Fingerprinter Lambda deployment package.
+
+  # ── Deployment strategy ───────────────────────────────────────────────────
+  LambdaTrafficShiftPercent:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 100
+    Description: >
+      Percentage of traffic routed to the new Lambda version during canary deployments.
+      CodeDeploy shifts the remaining traffic after the bake time. Set to 100 for instant.
+
+  # ── AI enrichment ─────────────────────────────────────────────────────────
+  AiProvider:
+    Type: String
+    Default: "none"
+    AllowedValues: [none, bedrock, gemini]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONDITIONS
+# ══════════════════════════════════════════════════════════════════════════════
+Conditions:
+  HasAlertEmail:   !Not [!Equals [!Ref AlertEmail, ""]]
+  HasAlarmEmail:   !Not [!Equals [!Ref AlarmEmail, ""]]
+  IsProduction:    !Equals [!Ref Environment, "prod"]
+  EnableXRay:      !Equals [!Ref Environment, "prod"]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RESOURCES
+# ══════════════════════════════════════════════════════════════════════════════
+Resources:
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # KMS — Customer-managed keys
+  # ────────────────────────────────────────────────────────────────────────────
+  PipelineKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "Log Fingerprinting CMK (${Environment})"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: RootFullAccess
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root" }
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: LambdaDecrypt
+            Effect: Allow
+            Principal:
+              AWS:
+                - !GetAtt IngestorRole.Arn
+                - !GetAtt FingerprinterRole.Arn
+            Action: [kms:Decrypt, kms:GenerateDataKey]
+            Resource: "*"
+          - Sid: SNSEncrypt
+            Effect: Allow
+            Principal: { Service: sns.amazonaws.com }
+            Action: [kms:Decrypt, kms:GenerateDataKey]
+            Resource: "*"
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  PipelineKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/log-fingerprinting-${Environment}"
+      TargetKeyId: !Ref PipelineKMSKey
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # DynamoDB — fingerprint state store
+  # ────────────────────────────────────────────────────────────────────────────
+  FingerprintTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "log-fingerprints-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref PipelineKMSKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: ErrorSignature
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ErrorSignature
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: TTL
+        Enabled: false   # Enable if you want old fingerprints to expire
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: log-fingerprinting
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # SQS — Dead Letter Queue for failed Lambda invocations
+  # ────────────────────────────────────────────────────────────────────────────
+  FingerprinterDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "log-fingerprinter-dlq-${Environment}"
+      KmsMasterKeyId: !Ref PipelineKMSKey
+      MessageRetentionPeriod: 1209600   # 14 days
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  FingerprinterDLQPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref FingerprinterDLQ]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: !GetAtt FingerprinterDLQ.Arn
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # SNS — regression alert topic
+  # ────────────────────────────────────────────────────────────────────────────
+  RegressionAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "log-fingerprint-regressions-${Environment}"
+      DisplayName: !Sub "Log Fingerprint Regression Alerts (${Environment})"
+      KmsMasterKeyId: !Ref PipelineKMSKey
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  RegressionAlertEmailSub:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref RegressionAlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "log-fingerprint-alarms-${Environment}"
+      DisplayName: !Sub "Log Fingerprint CloudWatch Alarms (${Environment})"
+
+  AlarmEmailSub:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # IAM — Ingestor Lambda execution role
+  # ────────────────────────────────────────────────────────────────────────────
+  IngestorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "log-fp-ingestor-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: IngestorPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: InvokeFingerprinter
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:log-fp-fingerprinter-${Environment}:LIVE"
+              - Sid: XRayWrite
+                Effect: Allow
+                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords]
+                Resource: "*"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # IAM — Fingerprinter Lambda execution role
+  # ────────────────────────────────────────────────────────────────────────────
+  FingerprinterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "log-fp-fingerprinter-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: FingerprinterPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: DynamoDBReadWrite
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt FingerprintTable.Arn
+              - Sid: PublishAlert
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref RegressionAlertTopic
+              - Sid: WriteDLQ
+                Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt FingerprinterDLQ.Arn
+              - Sid: KMSAccess
+                Effect: Allow
+                Action: [kms:Decrypt, kms:GenerateDataKey]
+                Resource: !GetAtt PipelineKMSKey.Arn
+              - Sid: BedrockInvoke
+                Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0"
+              - Sid: XRayWrite
+                Effect: Allow
+                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords]
+                Resource: "*"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # IAM — CodeDeploy role for Lambda traffic shifting
+  # ────────────────────────────────────────────────────────────────────────────
+  CodeDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "log-fp-codedeploy-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codedeploy.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSCodeDeployRoleForLambda
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Lambda — Ingestor
+  # ────────────────────────────────────────────────────────────────────────────
+  IngestorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "log-fp-ingestor-${Environment}"
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: ingestor.handler
+      Role: !GetAtt IngestorRole.Arn
+      Code:
+        S3Bucket: !Ref CodeBucketName
+        S3Key: !Ref IngestorS3Key
+      MemorySize: 256
+      Timeout: 60
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          RELEASE_ID: !Ref ReleaseID
+          EXCLUDE_PATTERNS: !Ref ExcludePatterns
+          FINGERPRINTER_FUNCTION_NAME: !Sub "log-fp-fingerprinter-${Environment}:LIVE"
+      TracingConfig:
+        Mode: !If [EnableXRay, Active, PassThrough]
+      DeadLetterConfig:
+        TargetArn: !GetAtt FingerprinterDLQ.Arn
+      Tags:
+        Environment: !Ref Environment
+        Project: log-fingerprinting
+
+  IngestorVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref IngestorFunction
+      Description: !Sub "Release ${ReleaseID}"
+
+  IngestorAlias:
+    Type: AWS::Lambda::Alias
+    Properties:
+      Name: LIVE
+      FunctionName: !Ref IngestorFunction
+      FunctionVersion: !GetAtt IngestorVersion.Version
+
+  IngestorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/log-fp-ingestor-${Environment}"
+      RetentionInDays: !If [IsProduction, 90, 14]
+
+  # CloudWatch Logs subscription filter → Ingestor Lambda
+  SourceLogSubscriptionFilter:
+    Type: AWS::Logs::SubscriptionFilter
+    Properties:
+      LogGroupName: !Ref SourceLogGroupName
+      FilterPattern: >-
+        { ($.message = "*ERROR*") && ($.message != "*Unable to upload to API*") && ($.message != "*friendly_reason:*") }
+      DestinationArn: !GetAtt IngestorAlias.AliasArn
+
+  IngestorCWPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IngestorAlias
+      Action: lambda:InvokeFunction
+      Principal: logs.amazonaws.com
+      SourceArn: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${SourceLogGroupName}:*"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Lambda — Fingerprinter
+  # ────────────────────────────────────────────────────────────────────────────
+  FingerprinterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "log-fp-fingerprinter-${Environment}"
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: fingerprinter.handler
+      Role: !GetAtt FingerprinterRole.Arn
+      Code:
+        S3Bucket: !Ref CodeBucketName
+        S3Key: !Ref FingerprinterS3Key
+      MemorySize: 256
+      Timeout: 60
+      ReservedConcurrentExecutions: 50   # guard against burst; tune per load
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          RELEASE_ID: !Ref ReleaseID
+          TABLE_NAME: !Ref FingerprintTable
+          SNS_TOPIC_ARN: !Ref RegressionAlertTopic
+          AI_PROVIDER: !Ref AiProvider
+      TracingConfig:
+        Mode: !If [EnableXRay, Active, PassThrough]
+      DeadLetterConfig:
+        TargetArn: !GetAtt FingerprinterDLQ.Arn
+      Tags:
+        Environment: !Ref Environment
+        Project: log-fingerprinting
+
+  FingerprinterVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref FingerprinterFunction
+      Description: !Sub "Release ${ReleaseID}"
+
+  FingerprinterAlias:
+    Type: AWS::Lambda::Alias
+    Properties:
+      Name: LIVE
+      FunctionName: !Ref FingerprinterFunction
+      FunctionVersion: !GetAtt FingerprinterVersion.Version
+
+  FingerprinterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/log-fp-fingerprinter-${Environment}"
+      RetentionInDays: !If [IsProduction, 90, 14]
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # CodeDeploy — canary / linear traffic shifting for Lambda
+  # ────────────────────────────────────────────────────────────────────────────
+  CodeDeployApp:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Sub "log-fingerprinting-${Environment}"
+      ComputePlatform: Lambda
+
+  FingerprinterDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref CodeDeployApp
+      DeploymentGroupName: !Sub "fingerprinter-${Environment}"
+      ServiceRoleArn: !GetAtt CodeDeployRole.Arn
+      DeploymentConfigName: !If
+        - IsProduction
+        - CodeDeployDefault.LambdaCanary10Percent5Minutes
+        - CodeDeployDefault.LambdaAllAtOnce
+      DeploymentStyle:
+        DeploymentType: BLUE_GREEN
+        DeploymentOption: WITH_TRAFFIC_CONTROL
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events: [DEPLOYMENT_FAILURE, DEPLOYMENT_STOP_ON_ALARM]
+      AlarmConfiguration:
+        Enabled: true
+        Alarms:
+          - Name: !Ref FingerprinterErrorAlarm
+
+  IngestorDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref CodeDeployApp
+      DeploymentGroupName: !Sub "ingestor-${Environment}"
+      ServiceRoleArn: !GetAtt CodeDeployRole.Arn
+      DeploymentConfigName: !If
+        - IsProduction
+        - CodeDeployDefault.LambdaCanary10Percent5Minutes
+        - CodeDeployDefault.LambdaAllAtOnce
+      DeploymentStyle:
+        DeploymentType: BLUE_GREEN
+        DeploymentOption: WITH_TRAFFIC_CONTROL
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events: [DEPLOYMENT_FAILURE, DEPLOYMENT_STOP_ON_ALARM]
+      AlarmConfiguration:
+        Enabled: true
+        Alarms:
+          - Name: !Ref IngestorErrorAlarm
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # CloudWatch Alarms
+  # ────────────────────────────────────────────────────────────────────────────
+  IngestorErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "log-fp-ingestor-errors-${Environment}"
+      AlarmDescription: "Ingestor Lambda error rate > 5% over 5 minutes"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref IngestorFunction
+        - Name: Resource
+          Value: !Sub "${IngestorFunction}:LIVE"
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  FingerprinterErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "log-fp-fingerprinter-errors-${Environment}"
+      AlarmDescription: "Fingerprinter Lambda error rate > 5 errors over 5 minutes"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FingerprinterFunction
+        - Name: Resource
+          Value: !Sub "${FingerprinterFunction}:LIVE"
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  FingerprinterDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "log-fp-fingerprinter-duration-${Environment}"
+      AlarmDescription: "Fingerprinter p99 duration > 10s — DynamoDB latency spike?"
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FingerprinterFunction
+      ExtendedStatistic: p99
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10000   # milliseconds
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  DLQDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "log-fp-dlq-depth-${Environment}"
+      AlarmDescription: "Messages accumulating in DLQ — Lambda failures need investigation"
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt FingerprinterDLQ.QueueName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # SSM Parameter Store — runtime config (avoids Lambda redeployment for config)
+  # ────────────────────────────────────────────────────────────────────────────
+  ExcludePatternsParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/log-fingerprinting/${Environment}/exclude-patterns"
+      Type: String
+      Value: !Ref ExcludePatterns
+      Description: Comma-separated log message substrings to exclude from fingerprinting.
+      Tags:
+        Environment: !Ref Environment
+
+  ReleaseIDParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/log-fingerprinting/${Environment}/release-id"
+      Type: String
+      Value: !Ref ReleaseID
+      Description: Current ReleaseID — update on each deployment to enable regression detection.
+      Tags:
+        Environment: !Ref Environment
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OUTPUTS
+# ══════════════════════════════════════════════════════════════════════════════
+Outputs:
+  FingerprintTableName:
+    Description: DynamoDB table storing error fingerprint state.
+    Value: !Ref FingerprintTable
+    Export: { Name: !Sub "${AWS::StackName}-Table" }
+
+  RegressionTopicArn:
+    Description: SNS topic ARN for regression alerts.
+    Value: !Ref RegressionAlertTopic
+    Export: { Name: !Sub "${AWS::StackName}-RegressionTopic" }
+
+  DLQUrl:
+    Description: Dead Letter Queue URL for failed fingerprint invocations.
+    Value: !Ref FingerprinterDLQ
+    Export: { Name: !Sub "${AWS::StackName}-DLQ" }
+
+  KMSKeyArn:
+    Description: KMS CMK ARN used for DynamoDB and SNS encryption.
+    Value: !GetAtt PipelineKMSKey.Arn
+    Export: { Name: !Sub "${AWS::StackName}-KMSKey" }
+
+  IngestorAliasArn:
+    Description: Ingestor Lambda LIVE alias ARN.
+    Value: !Ref IngestorAlias
+
+  FingerprinterAliasArn:
+    Description: Fingerprinter Lambda LIVE alias ARN.
+    Value: !Ref FingerprinterAlias
+
+  CodeDeployAppName:
+    Description: CodeDeploy application name for Lambda traffic-shifting deployments.
+    Value: !Ref CodeDeployApp
+    Export: { Name: !Sub "${AWS::StackName}-CodeDeployApp" }
